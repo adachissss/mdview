@@ -953,7 +953,7 @@
   }
 
   function pollDoc() {
-    if (!scrollPath || document.hidden || navigating) return;
+    if (!scrollPath || /\.pdf$/i.test(scrollPath) || document.hidden || navigating) return;
     var p = scrollPath;
     var generation = documentGeneration;
     fetch("/api/meta?p=" + encodeURIComponent(p), {

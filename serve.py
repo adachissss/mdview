@@ -319,19 +319,13 @@ def render_tree(node: dict, current: str | None, depth: int = 0, prefix: str = "
             f'data-name="{e(doc["label"].casefold())}" '
             f'data-mtime="{doc["mtime"]:.3f}" data-size="{doc["size"]}"'
         )
-        if doc.get("kind") == "pdf":
-            out.append(
-                '<li class="file pdf">'
-                f'<a href="/rawpdf/{q(doc["rel"])}" target="_blank" rel="noopener" {data} '
-                f'title="{e(doc["rel"])} · PDF（新标签打开）">'
-                f'{e(doc["label"])}<span class="ext">PDF</span></a></li>'
-            )
-            continue
         active = " active" if doc["rel"] == current else ""
+        kind = " pdf" if doc.get("kind") == "pdf" else ""
+        badge = '<span class="ext">PDF</span>' if kind else ""
         out.append(
-            f'<li class="file{active}">'
+            f'<li class="file{kind}{active}">'
             f'<a href="/d/{q(doc["rel"])}" data-path="{e(doc["rel"])}" {data} '
-            f'title="{e(doc["title"])}">{e(doc["label"])}</a></li>'
+            f'title="{e(doc["title"])}">{e(doc["label"])}{badge}</a></li>'
         )
     return "".join(out)
 
@@ -759,11 +753,8 @@ class Handler(BaseHTTPRequestHandler):
                 "<p>子目录会变成左侧的分组。</p></div></article>"
             )
             return self._html(200, page("mdview", sidebar_html(None, docs), body, "", crumbs_for(None)))
-        md_paths = [d["rel"] for d in docs if d["kind"] == "md"]
-        if not md_paths:
-            body = '<article class="doc"><div class="doc-body"><h1>我的文档</h1><p>从左侧目录选择 PDF 阅读。</p></div></article>'
-            return self._html(200, page("mdview", sidebar_html(None, docs), body, "", crumbs_for(None)))
-        available_json = json.dumps(md_paths, ensure_ascii=True).replace("<", "\\u003c")
+        paths = [d["rel"] for d in docs if d["kind"] == "md"] + [d["rel"] for d in docs if d["kind"] == "pdf"]
+        available_json = json.dumps(paths, ensure_ascii=True).replace("<", "\\u003c")
         bootstrap = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>mdview</title><script>
 (function(){{
@@ -968,6 +959,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_doc(self, rest: str, query: dict):
         rel = rest
+        if Path(rel).suffix.lower() == ".pdf":
+            return self.route_pdf(rel, query)
         doc = get_doc(rel)
         if doc is None:
             return self._not_found("文档不存在，或不在允许的目录内")
@@ -1020,6 +1013,33 @@ class Handler(BaseHTTPRequestHandler):
             f"{pager_html}"
             "</article>"
         )
+        return self._document_page(doc, body, query, all_docs, sig)
+
+    def route_pdf(self, rel: str, query: dict):
+        target = resolve_inside(rel)
+        if target is None:
+            return self._not_found("PDF 不存在")
+        try:
+            st = target.stat()
+        except OSError:
+            return self._not_found("PDF 不存在")
+        if not stat.S_ISREG(st.st_mode):
+            return self._not_found("PDF 不存在")
+        doc = doc_meta(target, rel, st)
+        source = f"/rawpdf/{q(rel)}"
+        body = (
+            '<section class="pdf-view" aria-label="PDF 阅读">'
+            '<div class="pdf-toolbar">'
+            f'<span class="pdf-title" title="{e(target.name)}">{e(target.name)}</span>'
+            f'<a href="{source}" target="_blank" rel="noopener">单独打开 ↗</a>'
+            '</div>'
+            f'<iframe class="pdf-frame" src="{source}#view=FitH&amp;navpanes=0" title="{e(target.name)}"></iframe>'
+            '</section>'
+        )
+        return self._document_page(doc, body, query, scan_docs())
+
+    def _document_page(self, doc: dict, body: str, query: dict, docs: list[dict], sig: str = ""):
+        rel = doc["rel"]
         crumbs = crumbs_for(rel, doc["label"])
 
         # 站内切换（全屏时点另一篇不刷新页面，全屏状态才保得住）
@@ -1044,7 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
             200,
             page(
                 f'{doc["title"]} · mdview',
-                sidebar_html(rel, all_docs),
+                sidebar_html(rel, docs),
                 body,
                 rel,
                 crumbs,

@@ -137,7 +137,7 @@ def _sanitize(body: str, rel_dir: str) -> str:
             parts = urllib.parse.urlsplit(value)
         except ValueError:
             return None
-        prefix = "/d/" if tag == "a" and resolved.lower().endswith((".md", ".markdown")) else "/asset/"
+        prefix = "/d/" if tag == "a" and resolved.lower().endswith((".md", ".markdown", ".pdf")) else "/asset/"
         return urllib.parse.urlunsplit(("", "", prefix + q(resolved), parts.query, parts.fragment))
 
     return nh3.clean(

@@ -166,8 +166,23 @@ class ServerTests(unittest.TestCase):
         self.write("only.pdf", "%PDF")
         status, _, body = self.request()
         self.assertEqual(status, 200)
-        self.assertIn(b"/rawpdf/only.pdf", body)
-        self.assertNotIn(b"location.replace", body)
+        self.assertIn(b'var paths=["only.pdf"]', body)
+        self.assertIn(b"location.replace", body)
+
+    def test_pdf_document_has_reader_and_active_sidebar(self):
+        self.write("reading.pdf", "%PDF")
+        status, _, body = self.request("/d/reading.pdf")
+        self.assertEqual(status, 200)
+        self.assertIn(b'<li class="file pdf active">', body)
+        self.assertIn(b'href="/d/reading.pdf" data-path="reading.pdf"', body)
+        self.assertIn(b'<iframe class="pdf-frame" src="/rawpdf/reading.pdf#view=FitH&amp;navpanes=0"', body)
+        status, _, body = self.request("/d/reading.pdf?frag=1")
+        self.assertEqual(status, 200)
+        fragment = json.loads(body)
+        self.assertEqual(fragment["path"], "reading.pdf")
+        self.assertIn('class="pdf-frame"', fragment["html"])
+        self.assertNotIn('<aside', fragment["html"])
+        self.assertEqual(self.request("/d/missing.pdf")[0], 404)
 
     def test_search_does_not_render_documents(self):
         self.write("a.md", "# Searching\n\nİSTANBUL and <needle>\n\n```python\nprint(42)\n```")
@@ -214,6 +229,7 @@ class RenderingTests(unittest.TestCase):
         body = render_markdown("[next](other.md?raw=1#s2)\n\n<img src='a%20b.png'>", "folder")["html"]
         self.assertIn('/d/folder/other.md?raw=1#s2', body)
         self.assertIn('/asset/folder/a%20b.png', body)
+        self.assertIn('/d/folder/paper.pdf', render_markdown('[PDF](paper.pdf)', 'folder')["html"])
 
     def test_code_mermaid_tasks_and_table_alignment(self):
         body = render_markdown("```python\nprint(1)\n```\n\n```mermaid\ngraph LR\n A-->B\n```\n\n- [x] done\n\n| a |\n|:--|\n| 1 |", "")["html"]
