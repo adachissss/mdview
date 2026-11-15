@@ -387,18 +387,6 @@ body:has(.pdf-view) .to-top { display: none; }
   flex-direction: column;
   height: calc(100dvh - var(--top-h));
 }
-.pdf-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 42px;
-  padding: 6px 16px;
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-}
-.pdf-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pdf-toolbar a { flex-shrink: 0; }
 .pdf-frame { flex: 1; min-height: 0; width: 100%; border: 0; background: #525659; }
 html.immersive .pdf-view { height: calc(100dvh - 76px); }
 

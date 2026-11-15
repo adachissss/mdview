@@ -1029,10 +1029,6 @@ class Handler(BaseHTTPRequestHandler):
         source = f"/rawpdf/{q(rel)}"
         body = (
             '<section class="pdf-view" aria-label="PDF 阅读">'
-            '<div class="pdf-toolbar">'
-            f'<span class="pdf-title" title="{e(target.name)}">{e(target.name)}</span>'
-            f'<a href="{source}" target="_blank" rel="noopener">单独打开 ↗</a>'
-            '</div>'
             f'<iframe class="pdf-frame" src="{source}#view=FitH&amp;navpanes=0" title="{e(target.name)}"></iframe>'
             '</section>'
         )
