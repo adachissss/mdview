@@ -2,6 +2,7 @@
 /auth
 *.log
 *.pid
+/.mdview.lock
 __pycache__/
 *.py[cod]
 .venv/

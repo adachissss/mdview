@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/project/mdview
-ExecStart=/usr/bin/python3 %h/project/mdview/serve.py --port 8899
+ExecStart=%h/project/mdview/.venv/bin/python %h/project/mdview/serve.py --port 8899
 Restart=always
 RestartSec=3
 

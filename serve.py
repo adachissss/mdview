@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mdview —— 局域网 Markdown 阅读服务（单文件）
+mdview —— 局域网 Markdown 与 PDF 阅读服务
 
 设计要点
-  * 只暴露一个根目录（默认 ./docs），目录里的 .md 才会被看到，其它文档天然隔离。
+  * 从一个文档根目录读取 Markdown、PDF 及资源，支持用户建立的软链接。
   * 左侧可折叠目录树 + 右侧渲染，服务端渲染，平板友好。
   * HTTP Basic 口令 + 一次性 ?k= 换 cookie，局域网内有门槛。
-  * 只读：没有任何写接口。
+  * 文档只读；添加目录接口仅创建用户指定的软链接。
 
 用法
   python3 serve.py                       # 默认 0.0.0.0:8899，根目录 ./docs
@@ -35,13 +35,11 @@ import sys
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from markdown_it import MarkdownIt
-from pygments import highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name
+from rendering import PYGMENTS_CSS, e, q, render_markdown
 
 VERSION = "1.4"
 APP_DIR = Path(__file__).resolve().parent
@@ -53,9 +51,9 @@ STATIC_DIR = APP_DIR / "static"
 def asset_version() -> str:
     """静态资源指纹：前端文件任一改动都会变，避免平板上拿到旧脚本。"""
     parts = [VERSION]
-    for f in (STATIC_DIR / "app.css", STATIC_DIR / "app.js", APP_DIR / "serve.py"):
+    for f in (STATIC_DIR / "app.css", STATIC_DIR / "app.js", APP_DIR / "serve.py", APP_DIR / "rendering.py"):
         try:
-            parts.append(str(int(f.stat().st_mtime)))
+            parts.append(str(f.stat().st_mtime_ns))
         except OSError:
             continue
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:8]
@@ -80,15 +78,6 @@ CFG = {
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
-
-
-def e(text: str) -> str:
-    return htmllib.escape(str(text), quote=True)
-
-
-def q(text: str) -> str:
-    """把仓库内相对路径变成安全 URL 片段。"""
-    return urllib.parse.quote(text, safe="/")
 
 
 def human_size(num: int) -> str:
@@ -116,28 +105,17 @@ def human_time(ts: float) -> str:
 # 文档扫描与缓存
 # ---------------------------------------------------------------------------
 _scan_lock = threading.Lock()
-_scan_state = {"docs": [], "stamp": None, "checked": 0.0}
+_scan_state = {"docs": [], "root": None, "checked": 0.0}
 _meta_lock = threading.Lock()
-_meta_cache: dict[str, tuple] = {}   # rel -> (mtime, size, title)
-_render_cache: dict[str, tuple] = {}  # rel -> (mtime, size, payload)
+_meta_cache: dict[Path, tuple] = {}
+_render_cache: OrderedDict[Path, tuple] = OrderedDict()
+MAX_RENDER_CACHE = 64
 
 SKIP_DIRS = {"node_modules", ".git", ".svn", "__pycache__", ".venv", "venv", ".idea", ".vscode"}
 
-# 中文排版的 CommonMark 兼容处理：
-# `**本页操作：**第` 这种「闭合定界符紧跟在全角标点后」的写法，严格 CommonMark 认为
-# 无法闭合，会原样显示星号。中文作者大量这么写，因此在定界符内侧补零宽空格，
-# 渲染后再统一删掉，既不影响视觉也不改变正文内容。
-_CJK_PUNCT = "，。：；！？、（）【】《》「」『』“”‘’…—·～"
-_CJK_CLASS = "".join(re.escape(ch) for ch in _CJK_PUNCT)
-_ZWSP = "\u200b"
 
-
-def fix_cjk_emphasis(text: str) -> str:
-    text = re.sub(rf"(?<=[{_CJK_CLASS}])(\*\*)", _ZWSP + r"\1", text)
-    text = re.sub(rf"(\*\*)(?=[{_CJK_CLASS}])", r"\1" + _ZWSP, text)
-    text = re.sub(rf"(?<!\*)(\*)(?=[{_CJK_CLASS}])", r"\1" + _ZWSP, text)
-    text = re.sub(rf"(?<=[{_CJK_CLASS}])(?<!\*)(\*)(?!\*)", _ZWSP + r"\1", text)
-    return text
+def file_version(st: os.stat_result) -> str:
+    return f"{st.st_dev}:{st.st_ino}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_size}"
 
 
 def iter_md_files(root: Path):
@@ -150,6 +128,11 @@ def iter_md_files(root: Path):
     while stack:
         cur = stack.pop()
         try:
+            st = cur.stat()
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
             with os.scandir(cur) as it:
                 entries = sorted(it, key=lambda e: e.name.casefold())
         except OSError:
@@ -163,15 +146,11 @@ def iter_md_files(root: Path):
             except OSError:
                 continue
             if stat.S_ISDIR(st.st_mode):
-                key = (st.st_dev, st.st_ino)
-                if key in seen:
-                    continue
-                seen.add(key)
                 stack.append(Path(ent.path))
             elif stat.S_ISREG(st.st_mode):
                 p = Path(ent.path)
                 if p.suffix.lower() in (".md", ".markdown", ".pdf"):
-                    yield p
+                    yield p, st
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
@@ -181,7 +160,8 @@ def extract_title(path: Path, rel: str) -> str:
     """取标题：优先 H1；没有 H1 就退到第一个任意级标题；再没有就用文件名。"""
     stem = Path(rel).stem
     try:
-        head = path.read_bytes()[:8192].decode("utf-8", "replace")
+        with path.open("rb") as fh:
+            head = fh.read(8192).decode("utf-8", "replace")
     except OSError:
         return stem
     fallback = None
@@ -199,208 +179,57 @@ def extract_title(path: Path, rel: str) -> str:
     return fallback or stem
 
 
-def doc_meta(path: Path, rel: str) -> dict:
-    st = path.stat()
-    key = (st.st_mtime, st.st_size)
-    with _meta_lock:
-        cached = _meta_cache.get(rel)
+def doc_meta(path: Path, rel: str, st: os.stat_result) -> dict:
+    key = file_version(st)
+    stem = Path(rel).stem
+    kind = "pdf" if path.suffix.lower() == ".pdf" else "md"
+    title = stem
+    if kind == "md":
+        with _meta_lock:
+            cached = _meta_cache.get(path)
         if cached and cached[0] == key:
             title = cached[1]
         else:
             title = extract_title(path, rel)
-            _meta_cache[rel] = (key, title)
-    stem = Path(rel).stem
-    kind = "pdf" if Path(rel).suffix.lower() == ".pdf" else "md"
+            with _meta_lock:
+                _meta_cache[path] = (key, title)
     return {
         "rel": rel,
         "name": stem,
         "label": stem,          # 侧栏一律显示文件名，标题只在悬停提示里
-        "title": title if kind == "md" else stem,
+        "title": title,
         "kind": kind,
         "mtime": st.st_mtime,
         "size": st.st_size,
+        "version": key,
     }
 
 
 def scan_docs() -> list[dict]:
-    """扫描根目录。
-
-    两层节流：1 秒内直接返回缓存（避免每次请求都遍历磁盘）；
-    超过 1 秒再用 (文件数, 最大 mtime) 判断是否真的有变化。
-    """
+    """每秒至多扫描一次，复用文件元数据并清理已移除文件的缓存。"""
     root = CFG["root"]
-    now = time.time()
     with _scan_lock:
-        if _scan_state["docs"] and now - _scan_state["checked"] < 1.0:
+        now = time.monotonic()
+        if _scan_state["root"] == root and now - _scan_state["checked"] < 1.0:
             return _scan_state["docs"]
-    files = list(iter_md_files(root)) if root.is_dir() else []
-    stamp = (len(files), max((f.stat().st_mtime for f in files), default=0.0))
-    with _scan_lock:
-        if _scan_state["stamp"] == stamp and _scan_state["docs"]:
-            _scan_state["checked"] = now
-            return _scan_state["docs"]
-    docs = []
-    for f in files:
-        rel = f.relative_to(root).as_posix()
-        try:
-            docs.append(doc_meta(f, rel))
-        except OSError:
-            continue
-    docs.sort(key=lambda d: d["rel"].casefold())
-    with _scan_lock:
-        _scan_state["docs"] = docs
-        _scan_state["stamp"] = stamp
-        _scan_state["checked"] = now
-    return docs
+        docs = []
+        for path, st in iter_md_files(root):
+            rel = path.relative_to(root).as_posix()
+            docs.append(doc_meta(path, rel, st))
+        docs.sort(key=lambda d: d["rel"].casefold())
+        active = {root / d["rel"] for d in docs}
+        with _meta_lock:
+            for cache in (_meta_cache, _render_cache):
+                for path in list(cache):
+                    if path not in active:
+                        del cache[path]
+        _scan_state.update(docs=docs, root=root, checked=time.monotonic())
+        return docs
 
 
 # ---------------------------------------------------------------------------
-# Markdown 渲染
+# 文档读取
 # ---------------------------------------------------------------------------
-
-
-def _render_fence(tokens, idx, options, env) -> str:
-    token = tokens[idx]
-    info = (token.info or "").strip()
-    lang = info.split()[0].lstrip("{.").rstrip("}") if info else ""
-    code = token.content
-    if lang.lower() == "mermaid":
-        return (
-            '<div class="mermaid-wrap">'
-            f'<pre class="mermaid">{e(code)}</pre>'
-            "</div>\n"
-        )
-    if lang and lang.lower() not in ("text", "plain", "plaintext", "txt"):
-        try:
-            lexer = get_lexer_by_name(lang, stripall=False)
-        except Exception:
-            lexer = None
-        if lexer is not None:
-            body = highlight(code, lexer, HtmlFormatter(nowrap=True))
-            cls = f' class="language-{e(lang)}"'
-            return (
-                f'<div class="code-block" data-lang="{e(lang)}">'
-                f"<button class=\"copy-btn\" type=\"button\" aria-label=\"复制代码\">复制</button>"
-                f"<pre><code{cls}>{body}</code></pre></div>\n"
-            )
-    return (
-        f'<div class="code-block" data-lang="{e(lang or "text")}">'
-        f"<button class=\"copy-btn\" type=\"button\" aria-label=\"复制代码\">复制</button>"
-        f"<pre><code>{e(code)}</code></pre></div>\n"
-    )
-
-
-def make_parser() -> MarkdownIt:
-    md = MarkdownIt(
-        "js-default",
-        options_update={"html": True, "breaks": False, "typographer": False, "linkify": False},
-    )
-    md.enable("table")
-    md.enable("strikethrough")
-    md.renderer.rules["fence"] = _render_fence
-    return md
-
-
-PARSER = make_parser()
-PYGMENTS_LIGHT = HtmlFormatter(style="friendly").get_style_defs(".code-block")
-PYGMENTS_DARK = HtmlFormatter(style="monokai").get_style_defs('[data-theme="dark"] .code-block')
-PYGMENTS_CSS = (
-    "/* light */\n"
-    + PYGMENTS_LIGHT
-    + "\n/* dark */\n"
-    + PYGMENTS_DARK
-    # 覆盖 pygments 自带的背景色，保持和页面主题一致
-    + "\n.code-block{background:var(--code-bg);}\n"
-    + '[data-theme="dark"] .code-block{background:var(--code-bg);}\n'
-)
-
-_SCRIPT_RE = re.compile(r"<\s*(script|iframe|object|embed)\b[^>]*>.*?<\s*/\s*\1\s*>", re.I | re.S)
-_ON_ATTR_RE = re.compile(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)
-_JS_URL_RE = re.compile(r"\b(href|src)\s*=\s*([\"'])\s*javascript:[^\"']*\2", re.I)
-_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*:|//|#|/)")
-
-
-def _resolve(rel_dir: str, target: str) -> str | None:
-    """把文档内的相对地址解析成站点内路径；越界返回 None。"""
-    if not target or _SCHEME_RE.match(target):
-        return None
-    raw = urllib.parse.unquote(target.split("#", 1)[0].split("?", 1)[0])
-    if not raw:
-        return None
-    joined = posixpath.normpath(posixpath.join(rel_dir, raw))
-    if joined.startswith("../") or joined == "..":
-        return None
-    return joined
-
-
-def _rewrite_urls(body: str, rel_dir: str) -> str:
-    def fix_img(m):
-        prefix, src = m.group(1), m.group(2)
-        resolved = _resolve(rel_dir, src)
-        if resolved is None:
-            return m.group(0)
-        return f'{prefix}/asset/{q(resolved)}"'
-
-    def fix_anchor(m):
-        prefix, href = m.group(1), m.group(2)
-        resolved = _resolve(rel_dir, href)
-        if resolved is None:
-            return m.group(0)
-        if resolved.lower().endswith((".md", ".markdown")):
-            return f'{prefix}/d/{q(resolved)}"'
-        return f'{prefix}/asset/{q(resolved)}"'
-
-    body = re.sub(r'(<img\b[^>]*?\bsrc=")([^"]*)"', fix_img, body)
-    body = re.sub(r'(<a\b[^>]*?\bhref=")([^"]*)"', fix_anchor, body)
-    body = body.replace("<table>", '<div class="table-wrap"><table>').replace("</table>", "</table></div>")
-    return body
-
-
-def _sanitize(body: str) -> str:
-    body = _SCRIPT_RE.sub("", body)
-    body = _ON_ATTR_RE.sub("", body)
-    body = _JS_URL_RE.sub(r'\1="#"', body)
-    return body
-
-
-_TASK_EMPTY_RE = re.compile(r"<li>(\s*)\[ \]\s+")
-_TASK_DONE_RE = re.compile(r"<li>(\s*)\[[xX]\]\s+")
-
-
-def _task_lists(body: str) -> str:
-    """把 GitHub 风格的 - [ ] / - [x] 渲染成方框，而不是字面量。"""
-    body = _TASK_EMPTY_RE.sub('<li class="task"><span class="box"></span>', body)
-    body = _TASK_DONE_RE.sub('<li class="task done"><span class="box checked"></span>', body)
-    return body
-
-
-def render_markdown(text: str, rel_dir: str) -> dict:
-    env: dict = {}
-    tokens = PARSER.parse(fix_cjk_emphasis(text), env)
-    toc: list[tuple[int, str, str]] = []
-    counter = 0
-    for i, token in enumerate(tokens):
-        if token.type == "heading_open" and token.tag in ("h1", "h2", "h3", "h4"):
-            counter += 1
-            hid = f"s{counter}"
-            token.attrSet("id", hid)
-            txt = ""
-            if i + 1 < len(tokens) and tokens[i + 1].type == "inline":
-                inline = tokens[i + 1]
-                if inline.children:
-                    txt = "".join(
-                        c.content for c in inline.children if c.type in ("text", "code_inline")
-                    )
-                else:
-                    txt = inline.content
-            toc.append((int(token.tag[1]), txt.strip(), hid))
-    body = PARSER.renderer.render(tokens, PARSER.options, env)
-    body = _rewrite_urls(body, rel_dir)
-    body = _sanitize(body)
-    body = _task_lists(body)
-    if _ZWSP in body:
-        body = body.replace(_ZWSP, "")
-    return {"html": body, "toc": toc}
 
 
 def resolve_inside(rel: str) -> Path | None:
@@ -409,11 +238,10 @@ def resolve_inside(rel: str) -> Path | None:
     不做 realpath：docs 里的软链接允许指向外部目录（用户自己 ln -s 进来的素材），
     但仍然拒绝 .. 越级和隐藏文件，服务本身是只读的。
     """
-    rel = posixpath.normpath("/" + rel).lstrip("/")
-    if not rel or rel.startswith(".."):
+    if not rel or rel.startswith("/") or "\x00" in rel or "\\" in rel:
         return None
     parts = rel.split("/")
-    if any(not p or p in (".", "..") or p.startswith(".") for p in parts):
+    if any(not p or p.startswith(".") or p in SKIP_DIRS for p in parts):
         return None
     return CFG["root"] / rel
 
@@ -422,15 +250,19 @@ def get_doc(rel: str) -> dict | None:
     target = resolve_inside(rel)
     if target is None or target.suffix.lower() not in (".md", ".markdown"):
         return None
-    if not target.is_file():
+    try:
+        st = target.stat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        version = file_version(st)
+        with _meta_lock:
+            cached = _render_cache.get(target)
+            if cached and cached[0] == version:
+                _render_cache.move_to_end(target)
+                return cached[1]
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
         return None
-    st = target.stat()
-    with _meta_lock:
-        cached = _render_cache.get(rel)
-    if cached and cached[0] == (st.st_mtime, st.st_size):
-        return cached[1]
-
-    text = target.read_text(encoding="utf-8", errors="replace")
     rel_dir = posixpath.dirname(rel)
     rendered = render_markdown(text, rel_dir)
     payload = {
@@ -443,9 +275,13 @@ def get_doc(rel: str) -> dict | None:
         "text": text,
         "mtime": st.st_mtime,
         "size": st.st_size,
+        "version": version,
     }
     with _meta_lock:
-        _render_cache[rel] = ((st.st_mtime, st.st_size), payload)
+        _render_cache[target] = (version, payload)
+        _render_cache.move_to_end(target)
+        while len(_render_cache) > MAX_RENDER_CACHE:
+            _render_cache.popitem(last=False)
     return payload
 
 
@@ -632,9 +468,6 @@ def crumbs_for(rel: str | None, title: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-LEGACY_AUTH_FILE = Path.home() / ".config" / "mdview" / "auth"  # 旧版本位置，仅用于自动迁移
-
-
 def _read_auth(path: Path) -> tuple[str, str] | None:
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -655,39 +488,29 @@ def load_or_create_auth() -> tuple[str, str]:
         got = _read_auth(AUTH_FILE)
         if got:
             return got
-
-    # 旧版本把口令写在 ~/.config/mdview/auth，自动搬进项目目录
-    if LEGACY_AUTH_FILE.is_file():
-        got = _read_auth(LEGACY_AUTH_FILE)
-        if got:
-            AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-            AUTH_FILE.write_text(
-                "# mdview 访问口令，改这里即可：用户名:密码\n"
-                f"# 由旧位置 {LEGACY_AUTH_FILE} 迁移而来\n{got[0]}:{got[1]}\n",
-                encoding="utf-8",
-            )
-            AUTH_FILE.chmod(0o600)
-            try:
-                LEGACY_AUTH_FILE.unlink()
-                LEGACY_AUTH_FILE.parent.rmdir()
-            except OSError:
-                pass
-            return got
+        raise ValueError("auth 文件需要包含有效的 用户名:口令")
 
     user = "md"
-    pwd = secrets.token_urlsafe(9)
+    pwd = secrets.token_urlsafe(24)
     AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    AUTH_FILE.write_text(
-        "# mdview 访问口令，改这里即可：用户名:密码\n"
-        f"# 本文件只在局域网内使用，不要提交到代码仓库或分享\n{user}:{pwd}\n",
-        encoding="utf-8",
-    )
-    AUTH_FILE.chmod(0o600)
+    try:
+        fd = os.open(AUTH_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        got = _read_auth(AUTH_FILE)
+        if got:
+            return got
+        raise ValueError("auth 文件需要包含有效的 用户名:口令") from None
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"# mdview 访问口令，请勿提交或分享\n{user}:{pwd}\n")
     return user, pwd
 
 
 def session_token(pwd: str) -> str:
     return hmac.new(pwd.encode(), b"mdview-session-v1", hashlib.sha256).hexdigest()
+
+
+def same_secret(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +620,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # 1) ?k=令牌：种一个长期 cookie，然后跳回不带令牌的干净地址
         key = (query.get("k") or [""])[0]
-        if key and hmac.compare_digest(key, token):
+        if key and same_secret(key, token):
             cookie = (
                 f"{COOKIE_NAME}={session_token(token)}; Path=/; "
                 "Max-Age=31536000; SameSite=Lax; HttpOnly"
@@ -810,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
         # 2) cookie（浏览器记住之后走这里，全程无需输入）
         for part in self.headers.get("Cookie", "").split(";"):
             name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and hmac.compare_digest(value, session_token(token)):
+            if name == COOKIE_NAME and same_secret(value, session_token(token)):
                 return True
 
         # 3) 传统 Basic（仅 --basic 模式）
@@ -822,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
                     user, _, given = decoded.partition(":")
                 except Exception:
                     user, given = "", ""
-                if hmac.compare_digest(user, CFG["auth_user"]) and hmac.compare_digest(given, token):
+                if same_secret(user, CFG["auth_user"]) and same_secret(given, token):
                     return True
                 time.sleep(0.4)
             body = (
@@ -892,6 +715,7 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self):
+        self.close_connection = True
         parsed = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if not self._guard(query):
@@ -899,11 +723,19 @@ class Handler(BaseHTTPRequestHandler):
         route = urllib.parse.unquote(parsed.path)
         try:
             if route == "/api/link":
+                if self.headers.get_content_type() != "application/json":
+                    self.close_connection = True
+                    return self._json(415, {"ok": False, "error": "请使用 application/json"})
+                origin = self.headers.get("Origin")
+                if origin and urllib.parse.urlsplit(origin).netloc != self.headers.get("Host"):
+                    self.close_connection = True
+                    return self._json(403, {"ok": False, "error": "不允许跨站创建目录链接"})
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
                     length = 0
                 if length <= 0 or length > 65536:
+                    self.close_connection = True
                     return self._json(400, {"ok": False, "error": "请求体不合法"})
                 try:
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -913,6 +745,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._not_found()
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except (OSError, ValueError):
+            self.close_connection = True
+            self._json(400, {"ok": False, "error": "目录请求不合法或无法访问"})
 
     def route_home(self):
         docs = scan_docs()
@@ -924,12 +759,17 @@ class Handler(BaseHTTPRequestHandler):
                 "<p>子目录会变成左侧的分组。</p></div></article>"
             )
             return self._html(200, page("mdview", sidebar_html(None, docs), body, "", crumbs_for(None)))
-        first = docs[0]["rel"]
+        md_paths = [d["rel"] for d in docs if d["kind"] == "md"]
+        if not md_paths:
+            body = '<article class="doc"><div class="doc-body"><h1>我的文档</h1><p>从左侧目录选择 PDF 阅读。</p></div></article>'
+            return self._html(200, page("mdview", sidebar_html(None, docs), body, "", crumbs_for(None)))
+        available_json = json.dumps(md_paths, ensure_ascii=True).replace("<", "\\u003c")
         bootstrap = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>mdview</title><script>
 (function(){{
   var last=null;try{{last=localStorage.getItem("mdview:last");}}catch(e){{}}
-  var target=last?("/d/"+encodeURIComponent(last).replace(/%2F/g,"/")):"/d/{q(first)}";
+  var paths={available_json};
+  var target="/d/"+encodeURIComponent(paths.indexOf(last)>=0?last:paths[0]).replace(/%2F/g,"/");
   location.replace(target);
 }})();
 </script></head><body></body></html>"""
@@ -992,6 +832,8 @@ class Handler(BaseHTTPRequestHandler):
             or name in (".", "..")
             or "/" in name
             or "\\" in name
+            or "\x00" in name
+            or name in SKIP_DIRS
             or name.startswith(".")
         ):
             return self._json(400, {"ok": False, "error": "链接名不合法"})
@@ -999,17 +841,15 @@ class Handler(BaseHTTPRequestHandler):
         link = root / name
         if link.exists() or link.is_symlink():
             return self._json(409, {"ok": False, "error": f"docs 下已有同名条目：{name}"})
-        if target == root:
-            return self._json(400, {"ok": False, "error": "不能链接 docs 自己"})
-
         try:
             os.symlink(target, link)
+        except FileExistsError:
+            return self._json(409, {"ok": False, "error": f"docs 下已有同名条目：{name}"})
         except OSError as exc:
             return self._json(500, {"ok": False, "error": f"创建失败：{exc.strerror or exc}"})
 
         # 让扫描缓存立刻失效
         with _scan_lock:
-            _scan_state["stamp"] = None
             _scan_state["checked"] = 0.0
         return self._json(200, {"ok": True, "name": name, "target": str(target)})
 
@@ -1023,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
             st = target.stat()
         except OSError:
             return self._send(404, b'{"ok":false}', "application/json; charset=utf-8")
-        payload = {"ok": True, "path": rel, "mtime": st.st_mtime, "size": st.st_size}
+        payload = {"ok": True, "path": rel, "mtime": st.st_mtime, "size": st.st_size, "version": file_version(st)}
         return self._send(
             200,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -1032,8 +872,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def route_static(self, name: str):
-        name = posixpath.normpath(urllib.parse.unquote(name)).lstrip("/")
-        if not name or name.startswith("..") or ".." in name.split("/"):
+        if not name or "\x00" in name or any(p.startswith(".") for p in name.split("/")):
             return self._not_found()
         try:
             target = (STATIC_DIR / name).resolve()
@@ -1044,78 +883,78 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         # 字体这类大文件可以长缓存；自己的 css/js 每次校验，改完立刻生效
         cache = "public, max-age=604800" if name.startswith("katex/") else "no-cache"
-        self._send(200, target.read_bytes(), ctype, {"Cache-Control": cache})
+        self._file(target, ctype, {"Cache-Control": cache})
 
-    def route_rawpdf(self, rest: str):
-        """原始 PDF：交给浏览器自带的阅读器（平板上的体验最好），支持 Range。"""
-        target = resolve_inside(urllib.parse.unquote(rest))
-        if target is None or target.suffix.lower() != ".pdf" or not target.is_file():
-            return self._not_found("PDF 不存在")
+    def _file(self, target: Path, ctype: str, extra: dict | None = None, ranges: bool = False):
+        """分块发送文件；HEAD 不读取正文，PDF 支持单段 Range。"""
         try:
-            size = target.stat().st_size
+            fh = target.open("rb")
         except OSError:
-            return self._not_found("PDF 不存在")
-
-        start, end, status = 0, max(0, size - 1), 200
-        rng = (self.headers.get("Range") or "").strip()
-        if rng.startswith("bytes="):
-            spec = rng[6:].split(",")[0].strip()
-            first, _, last = spec.partition("-")
-            try:
+            return self._not_found("资源不存在或无法读取")
+        with fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return self._not_found("资源不是普通文件")
+            size = st.st_size
+            start, end, status = 0, size - 1, 200
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip()) if ranges else None
+            if match and any(match.groups()):
+                first, last = match.groups()
                 if first:
                     start = int(first)
-                    end = int(last) if last else size - 1
-                    status = 206
-                elif last:
+                    end = min(int(last), size - 1) if last else size - 1
+                else:
                     start = max(0, size - int(last))
-                    status = 206
-            except ValueError:
-                start, end, status = 0, max(0, size - 1), 200
-        start = max(0, min(start, size - 1)) if size else 0
-        end = max(start, min(end, size - 1)) if size else 0
-        length = max(0, end - start + 1)
-
-        try:
+                if size == 0 or start >= size or end < start:
+                    return self._send(416, b"", ctype, {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+                status = 206
+            length = max(0, end - start + 1)
             self.send_response(status)
-            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(length))
-            self.send_header(
-                "Content-Disposition",
-                f"inline; filename*=UTF-8''{urllib.parse.quote(target.name)}",
-            )
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if ranges:
+                self.send_header("Accept-Ranges", "bytes")
             if status == 206:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             if self.command == "HEAD":
                 return
-            remaining = length
-            with target.open("rb") as fh:
-                fh.seek(start)
-                while remaining > 0:
-                    chunk = fh.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            fh.seek(start)
+            while length:
+                chunk = fh.read(min(65536, length))
+                if not chunk:
+                    self.close_connection = True
+                    break
+                self.wfile.write(chunk)
+                length -= len(chunk)
+
+    def route_rawpdf(self, rest: str):
+        target = resolve_inside(rest)
+        if target is None or target.suffix.lower() != ".pdf":
+            return self._not_found("PDF 不存在")
+        return self._file(target, "application/pdf", {
+            "Content-Disposition": f"inline; filename*=UTF-8''{urllib.parse.quote(target.name)}",
+            "Cache-Control": "private, no-cache",
+        }, ranges=True)
 
     def route_asset(self, rest: str):
-        target = resolve_inside(urllib.parse.unquote(rest))
+        target = resolve_inside(rest)
         if target is None:
             return self._not_found("路径不合法")
-        if not target.is_file():
-            return self._not_found("资源不存在")
+        if target.suffix.lower() == ".pdf":
+            return self.route_rawpdf(rest)
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        return self._send(
-            200,
-            target.read_bytes(),
-            ctype,
-            {"Cache-Control": "public, max-age=60"},
-        )
+        headers = {
+            "Cache-Control": "private, no-cache",
+            "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        }
+        if not ctype.startswith("image/"):
+            headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{urllib.parse.quote(target.name)}"
+        return self._file(target, ctype, headers)
 
     def _neighbors(self, docs: list[dict], rel: str):
         rels = [d["rel"] for d in docs]
@@ -1128,7 +967,7 @@ class Handler(BaseHTTPRequestHandler):
         return prev, nxt
 
     def route_doc(self, rest: str, query: dict):
-        rel = posixpath.normpath(urllib.parse.unquote(rest)).lstrip("/")
+        rel = rest
         doc = get_doc(rel)
         if doc is None:
             return self._not_found("文档不存在，或不在允许的目录内")
@@ -1173,7 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
         sig = hashlib.sha1(doc["html"].encode("utf-8")).hexdigest()[:16]
         body = (
             f'<article class="doc" data-title="{e(doc["title"])}" '
-            f'data-mtime="{doc["mtime"]:.6f}" data-sig="{sig}">'
+            f'data-version="{doc["version"]}" data-sig="{sig}">'
             f'{toc_html}'
             f'<div class="doc-body">{doc["html"]}</div>'
             f'<div class="doc-meta">更新于 {human_time(doc["mtime"])} · {human_size(doc["size"])} · '
@@ -1191,6 +1030,7 @@ class Handler(BaseHTTPRequestHandler):
                 "html": body,
                 "crumbs": crumbs,
                 "mtime": doc["mtime"],
+                "version": doc["version"],
                 "sig": sig,
             }
             return self._send(
@@ -1216,33 +1056,32 @@ class Handler(BaseHTTPRequestHandler):
         docs = scan_docs()
         items = []
         if query:
-            needle = query.casefold()
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
             for d in docs:
                 if d.get("kind") != "md":
                     continue
-                doc = get_doc(d["rel"])
-                if not doc:
+                target = resolve_inside(d["rel"])
+                if target is None:
                     continue
-                hay = doc["text"].casefold()
-                pos = hay.find(needle)
-                if pos < 0 and needle not in d["name"].casefold() and needle not in d["title"].casefold():
+                try:
+                    text = target.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                match = pattern.search(text)
+                if match is None and not pattern.search(d["name"]) and not pattern.search(d["title"]):
                     continue
                 snippet = ""
-                if pos >= 0:
-                    start = max(0, pos - 70)
-                    end = min(len(doc["text"]), pos + len(query) + 70)
-                    frag = doc["text"][start:end].replace("\n", " ")
-                    low = frag.casefold()
+                if match:
+                    start = max(0, match.start() - 70)
+                    end = min(len(text), match.end() + 70)
+                    frag = text[start:end].replace("\n", " ")
                     out, cursor = [], 0
-                    while True:
-                        j = low.find(needle, cursor)
-                        if j < 0:
-                            out.append(e(frag[cursor:]))
-                            break
-                        out.append(e(frag[cursor:j]))
-                        out.append(f"<mark>{e(frag[j:j + len(query)])}</mark>")
-                        cursor = j + len(query)
-                    snippet = ("…" if start > 0 else "") + "".join(out) + ("…" if end < len(doc["text"]) else "")
+                    for hit in pattern.finditer(frag):
+                        out.append(e(frag[cursor:hit.start()]))
+                        out.append(f"<mark>{e(hit.group())}</mark>")
+                        cursor = hit.end()
+                    out.append(e(frag[cursor:]))
+                    snippet = ("…" if start > 0 else "") + "".join(out) + ("…" if end < len(text) else "")
                 items.append(
                     f'<a class="result" href="/d/{q(d["rel"])}">'
                     f'<div class="r-title">{e(d["title"])}</div>'

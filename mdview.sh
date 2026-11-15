@@ -7,7 +7,8 @@
 #   ./mdview.sh status    是否在跑 / 端口 / 访问地址
 #   ./mdview.sh log       跟踪日志（含口令）
 #
-# 环境变量：MDVIEW_PORT  MDVIEW_ROOT  MDVIEW_ARGS（附加参数，如 --no-auth）
+# 环境变量：MDVIEW_PORT  MDVIEW_ROOT  MDVIEW_ARGS
+# 附加参数也可直接传入：./mdview.sh start --bind 127.0.0.1
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,13 +16,19 @@ PIDFILE="$DIR/.mdview.pid"
 LOG="$DIR/mdview.log"
 PORT="${MDVIEW_PORT:-8899}"
 ROOT="${MDVIEW_ROOT:-$DIR/docs}"
-PY="$(command -v python3)"
+PY="$DIR/.venv/bin/python"
+[[ -x "$PY" ]] || PY="$(command -v python3)"
 
 running() {
   [[ -f "$PIDFILE" ]] || return 1
   local pid
+  local -a process_args
   pid="$(cat "$PIDFILE" 2>/dev/null || true)"
-  [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  mapfile -d '' -t process_args <"/proc/$pid/cmdline"
+  [[ "${process_args[1]:-}" == "$DIR/serve.py" ]]
 }
 
 start() {
@@ -31,7 +38,9 @@ start() {
   fi
   mkdir -p "$ROOT"
   echo "启动 mdview: 端口 $PORT，文档目录 $ROOT"
-  nohup "$PY" "$DIR/serve.py" --port "$PORT" --root "$ROOT" ${MDVIEW_ARGS:-} >>"$LOG" 2>&1 &
+  local -a extra_args=()
+  read -r -a extra_args <<<"${MDVIEW_ARGS:-}"
+  nohup "$PY" "$DIR/serve.py" --port "$PORT" --root "$ROOT" "${extra_args[@]}" "$@" 9>&- >>"$LOG" 2>&1 &
   echo $! >"$PIDFILE"
   sleep 0.8
   if running; then
@@ -53,11 +62,11 @@ stop() {
   local pid
   pid="$(cat "$PIDFILE")"
   kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    kill -0 "$pid" 2>/dev/null || break
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    running || break
     sleep 0.1
   done
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  if running; then kill -9 "$pid" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   echo "已停止"
 }
@@ -83,10 +92,18 @@ status() {
   echo "  提示：平板 Wi-Fi 详情里的 IP 要和上面同一网段；不同网段请用热点兜底"
 }
 
-case "${1:-}" in
-  start) start ;;
-  stop) stop ;;
-  restart) stop; start ;;
+action="${1:-}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$action" in
+  start|stop|restart)
+    exec 9>"$DIR/.mdview.lock"
+    flock 9
+    case "$action" in
+      start) start "$@" ;;
+      stop) stop ;;
+      restart) stop; start "$@" ;;
+    esac
+    ;;
   status) status ;;
   log) tail -f "$LOG" ;;
   *) echo "用法：$0 {start|stop|restart|status|log}"; exit 1 ;;

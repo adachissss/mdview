@@ -5,6 +5,10 @@
   var root = document.documentElement;
   var body = document.body;
   var path = body.getAttribute("data-path") || "";
+  var lastUserScroll = 0;
+  var realignTimers = [];
+  var documentGeneration = 0;
+  var placeDocHandle = function () {};
   var store = {
     get: function (k, d) {
       try {
@@ -144,7 +148,7 @@
         docEl.style.transform = "";
         docEl.style.willChange = "";
       }
-      // 松手才落档：一次重排，前面全程走 GPU，不再一顿一顿
+      // 手势期间使用 transform 预览，松手时更新 zoom，减少重排
       var ratio = targetZoom / startZoom;
       applyZoom(targetZoom, true, 5);
       // 让手指按住的那一点在落档后仍停在原处
@@ -298,7 +302,7 @@
   /* 拖动右边缘；向左拖过阈值 = 整栏折叠，点边缘小把手再展开 */
   var resizer = $("#side-resizer");
   if (resizer) {
-    // 松手停在哪里就是哪里，不再吸附回“最小可用宽度”；
+    // 松手时保留当前宽度；
     // 只有拖到 COLLAPSE_AT 以下才会整栏折叠（拖拽过程允许更窄，便于看到折叠意图）
     var MIN_W = 120, MAX_W = 460, MIN_DRAG = 90, COLLAPSE_AT = 120, drag = null;
 
@@ -478,9 +482,12 @@
     store.set(scrollKey(scrollPath, ":t"), String(Date.now()));
   }
   function restoreScrollFor(p) {
+    var generation = documentGeneration;
     var y = parseInt(store.get(scrollKey(p), "0"), 10) || 0;
     var t = parseInt(store.get(scrollKey(p, ":t"), "0"), 10) || 0;
-    var jump = function () { window.scrollTo(0, y); };
+    var jump = function () {
+      if (generation === documentGeneration && p === scrollPath) window.scrollTo(0, y);
+    };
     if (y > 40 && Date.now() - t < 1000 * 60 * 60 * 24 * 7) {
       requestAnimationFrame(function () { requestAnimationFrame(jump); });
       setTimeout(jump, 160);
@@ -698,7 +705,7 @@
 
     function place() {
       var doc = document.querySelector(".doc");
-      if (!doc || !handle) return;
+      if (!doc) { handle.style.display = "none"; return; }
       var rect = doc.getBoundingClientRect();
       handle.style.left = Math.round(rect.right - 7) + "px";
       handle.style.display = content.clientWidth < 520 ? "none" : "";
@@ -746,12 +753,7 @@
     place();
     applyDocMax(zoom / 100);
 
-    // 切文档、换缩放后重新定位
-    var baseRender = renderDoc;
-    renderDoc = function (data, hash) {
-      baseRender(data, hash);
-      requestAnimationFrame(place);
-    };
+    placeDocHandle = place;
     document.addEventListener("click", function () { requestAnimationFrame(place) }, true);
   })();
 
@@ -759,9 +761,6 @@
   var contentEl = $("#content");
   var crumbsEl = document.querySelector(".crumbs");
   var navigating = false;
-
-  var lastUserScroll = 0;
-  var realignTimers = [];
 
   function markUserScroll() {
     lastUserScroll = Date.now();
@@ -805,6 +804,13 @@
   }
 
   function renderDoc(data, hash) {
+    documentGeneration += 1;
+    clearTimeout(refreshTimer);
+    refreshTimer = 0;
+    realignTimers.forEach(clearTimeout);
+    realignTimers = [];
+    liveVersion = data.version || "";
+    lastSig = data.sig || "";
     if (contentEl) contentEl.innerHTML = data.html;
     if (crumbsEl) crumbsEl.innerHTML = data.crumbs;
     document.title = data.title + " · mdview";
@@ -813,6 +819,7 @@
     store.set("mdview:last", data.path);
     setActiveLink(data.path);
     bindContent(contentEl);
+    requestAnimationFrame(placeDocHandle);
     if (isNarrow()) setSidebar(false);
     if (hash) {
       setTimeout(function () {
@@ -847,7 +854,7 @@
       })
       .catch(function () {
         navigating = false;
-        window.location.href = href;
+        window.location.href = href + hash;
       });
   }
 
@@ -875,7 +882,7 @@
   });
 
   window.addEventListener("popstate", function () {
-    var href = location.pathname + location.search;
+    var href = location.pathname + location.search + location.hash;
     if (href.indexOf("/d/") !== 0) { location.reload(); return; }
     go(href, false);
   });
@@ -886,8 +893,9 @@
 
   try { history.replaceState({ path: path }, "", location.href); } catch (e) {}
   /* ---------------- 文档改动自动更新 ---------------- */
-  var liveMtime = 0;
+  var liveVersion = "";
   var refreshTimer = 0;
+  var refreshInFlight = null;
   var toastEl = null;
   var toastTimer = 0;
 
@@ -911,8 +919,9 @@
   var lastSig = "";
   function refreshCurrent() {
     var p = scrollPath;
-    if (!p) return;
-    var keepY = Math.round(window.scrollY);
+    var generation = documentGeneration;
+    if (!p || refreshInFlight === generation) return;
+    refreshInFlight = generation;
     fetch(docUrl(p) + "?frag=1", {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
@@ -920,36 +929,43 @@
       if (!r.ok) throw new Error(String(r.status));
       return r.json();
     }).then(function (data) {
+      if (p !== scrollPath || generation !== documentGeneration || navigating) return;
+      liveVersion = data.version || liveVersion;
       // 内容没变（只是保存时间变了）就不动 DOM，避免任何闪烁
       if (data.sig && data.sig === lastSig) {
-        liveMtime = data.mtime || liveMtime;
         return;
       }
+      var keepY = Math.round(window.scrollY);
       lastSig = data.sig || "";
       if (contentEl) contentEl.innerHTML = data.html;
       if (crumbsEl) crumbsEl.innerHTML = data.crumbs;
       document.title = data.title + " · mdview";
       bindContent(contentEl);
-      liveMtime = data.mtime || liveMtime;
-      var restore = function () { window.scrollTo(0, keepY); };
+      requestAnimationFrame(placeDocHandle);
+      var restore = function () {
+        if (generation === documentGeneration) window.scrollTo(0, keepY);
+      };
       requestAnimationFrame(restore);
       setTimeout(restore, 120);
-    }).catch(function () { /* 文件可能被删了，下一轮再说 */ });
+    }).catch(function () { /* 下次轮询会重试 */ }).then(function () {
+      if (refreshInFlight === generation) refreshInFlight = null;
+    });
   }
 
   function pollDoc() {
-    if (!scrollPath || document.hidden) return;
-    fetch("/api/meta?p=" + encodeURIComponent(scrollPath), {
+    if (!scrollPath || document.hidden || navigating) return;
+    var p = scrollPath;
+    var generation = documentGeneration;
+    fetch("/api/meta?p=" + encodeURIComponent(p), {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
     }).then(function (r) {
       if (!r.ok) throw new Error(String(r.status));
       return r.json();
     }).then(function (meta) {
-      if (!meta || !meta.ok) return;
-      if (!liveMtime) { liveMtime = meta.mtime; return; }
-      if (Math.abs(meta.mtime - liveMtime) > 0.0005) {
-        liveMtime = meta.mtime;
+      if (!meta || !meta.ok || p !== scrollPath || generation !== documentGeneration) return;
+      if (!liveVersion) { liveVersion = meta.version; return; }
+      if (meta.version !== liveVersion) {
         if (refreshTimer) return;
         refreshTimer = setTimeout(function () {
           refreshTimer = 0;
@@ -959,10 +975,10 @@
     }).catch(function () {});
   }
 
-  // 首屏渲染时把 mtime 写进了 article，直接当基线，避免漏掉第一次改动
-  var initialDoc = document.querySelector(".doc[data-mtime]");
+  // 使用首屏的文件版本作为轮询基线
+  var initialDoc = document.querySelector(".doc[data-version]");
   if (initialDoc) {
-    liveMtime = parseFloat(initialDoc.getAttribute("data-mtime")) || 0;
+    liveVersion = initialDoc.getAttribute("data-version") || "";
     lastSig = initialDoc.getAttribute("data-sig") || "";
   }
 
@@ -970,15 +986,6 @@
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden) pollDoc();
   });
-
-  // 每次切换文档后重置基线（下一次轮询重新取）
-  var _renderDoc = renderDoc;
-  renderDoc = function (data, hash) {
-    _renderDoc(data, hash);
-    liveMtime = data.mtime || 0;
-    lastSig = data.sig || "";
-  };
-
 
   /* ---------------- 添加目录：选一个目录，以软链接放进 docs ---------------- */
   var addDirBtn = $("#add-dir");
