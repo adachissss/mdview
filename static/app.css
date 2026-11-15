@@ -86,6 +86,30 @@ a { color: var(--accent); text-decoration: none; }
   z-index: 30;
 }
 
+:root.top-collapsed { --top-h: 0px; }
+.top-collapsed .topbar { display: none; }
+.top-tab {
+  position: fixed;
+  top: 0;
+  right: 14px;
+  z-index: 45;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
+  background: var(--elev);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.top-collapsed .top-tab { display: flex; }
+.top-tab:hover, .top-tab:focus-visible { color: var(--accent); border-color: var(--accent); }
+
 .icon-btn {
   appearance: none;
   border: 0;
@@ -409,6 +433,7 @@ html.immersive .pdf-view { height: calc(100dvh - 76px); }
 
 /* 全屏（浏览器原生全屏失败时的沉浸模式） */
 html.immersive .topbar,
+html.immersive .top-tab,
 html.immersive .sidebar,
 html.immersive .side-tab,
 html.immersive .to-top { display: none !important; }
@@ -831,7 +856,7 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 0
 
 /* 打印：直接出 PDF */
 @media print {
-  .sidebar, .topbar, .overlay, .to-top, .copy-btn, .pager, .doc-meta { display: none !important; }
+  .sidebar, .topbar, .top-tab, .overlay, .to-top, .copy-btn, .pager, .doc-meta { display: none !important; }
   .content { margin: 0; padding: 0; }
   .doc { max-width: none !important; padding: 0; zoom: 1 !important; }
   .doc-body { font-size: 12pt; }

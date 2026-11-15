@@ -391,6 +391,7 @@ PAGE_HEAD = """<!DOCTYPE html>
     d.style.setProperty("--doc-max",Math.round(736/(z/100))+"px");
   }}
   if(localStorage.getItem("mdview:sideCollapsed")==="1")d.classList.add("side-collapsed");
+  if(localStorage.getItem("mdview:topCollapsed")==="1")d.classList.add("top-collapsed");
   var w=parseInt(localStorage.getItem("mdview:sideWidth")||"0",10);
   if(w>=90){{
     var lim=Math.max(120,Math.min(460,window.innerWidth-420));
@@ -411,8 +412,10 @@ PAGE_HEAD = """<!DOCTYPE html>
     </div>
     <button class="icon-btn" id="theme" type="button" aria-label="切换深浅色">◐</button>
     <button class="icon-btn" id="fs" type="button" aria-label="全屏" title="全屏 / 退出全屏">⛶</button>
+    <button class="icon-btn" id="collapse-top" type="button" aria-label="收起顶栏" title="收起顶栏">⌃</button>
   </div>
 </header>
+<button class="top-tab" id="top-tab" type="button" aria-label="展开顶栏" title="展开顶栏">⌄</button>
 <div class="overlay" id="overlay"></div>
 <aside class="sidebar" id="sidebar">{sidebar}</aside>
 <button class="side-tab" id="side-tab" type="button" aria-label="展开目录" title="展开目录">›</button>

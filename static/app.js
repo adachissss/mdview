@@ -25,6 +25,18 @@
   function $(sel) { return document.querySelector(sel); }
   function $all(sel) { return Array.prototype.slice.call(document.querySelectorAll(sel)); }
 
+  /* ---------------- 顶栏折叠 ---------------- */
+  var collapseTop = $("#collapse-top");
+  var topTab = $("#top-tab");
+  function setTopCollapsed(flag) {
+    root.classList.toggle("top-collapsed", flag);
+    store.set("mdview:topCollapsed", flag ? "1" : "0");
+    var button = flag ? topTab : collapseTop;
+    if (button) button.focus({ preventScroll: true });
+  }
+  if (collapseTop) collapseTop.addEventListener("click", function () { setTopCollapsed(true); });
+  if (topTab) topTab.addEventListener("click", function () { setTopCollapsed(false); });
+
   /* ---------------- 主题 ---------------- */
   var THEME_KEY = "mdview:theme";
   var themeBtn = $("#theme");
