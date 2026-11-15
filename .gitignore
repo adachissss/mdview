@@ -1,0 +1,18 @@
+# 本机口令与运行产物
+/auth
+*.log
+*.pid
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+.pytest_cache/
+.ruff_cache/
+
+# 个人文档和目录链接仅保留在本机，仓库只包含使用示例
+/docs/*
+!/docs/欢迎.md
+!/docs/示例/
+/docs/示例/*
+!/docs/示例/排版示例.md

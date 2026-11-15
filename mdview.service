@@ -1,0 +1,14 @@
+[Unit]
+Description=mdview -- LAN Markdown reader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/project/mdview
+ExecStart=/usr/bin/python3 %h/project/mdview/serve.py --port 8899
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
