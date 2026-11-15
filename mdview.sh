@@ -40,7 +40,7 @@ start() {
   echo "启动 mdview: 端口 $PORT，文档目录 $ROOT"
   local -a extra_args=()
   read -r -a extra_args <<<"${MDVIEW_ARGS:-}"
-  nohup "$PY" "$DIR/serve.py" --port "$PORT" --root "$ROOT" "${extra_args[@]}" "$@" 9>&- >>"$LOG" 2>&1 &
+  nohup setsid "$PY" "$DIR/serve.py" --port "$PORT" --root "$ROOT" "${extra_args[@]}" "$@" </dev/null 9>&- >>"$LOG" 2>&1 &
   echo $! >"$PIDFILE"
   sleep 0.8
   if running; then

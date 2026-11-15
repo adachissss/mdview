@@ -12,7 +12,7 @@
 
 ## 安装与启动
 
-需要 Python 3.10+。推荐使用虚拟环境安装依赖：
+使用 Python 3.12，通过虚拟环境安装依赖：
 
 ```bash
 git clone https://github.com/adachissss/mdview.git ~/project/mdview
@@ -141,7 +141,7 @@ bash -n mdview.sh
 node tests/browser.cjs
 ```
 
-浏览器测试会启动独立的临时服务，检查公式、图表、文档切换与自动刷新，并在 `/tmp/mdview-review-*.png` 保存横竖屏截图。GitHub Actions 检查 Python 3.10、3.12、3.13 的服务端测试和脚本语法。
+浏览器测试会启动独立的临时服务，检查公式、图表、文档切换与自动刷新，并在 `/tmp/mdview-review-*.png` 保存横竖屏截图。GitHub Actions 使用 Python 3.12 检查服务端测试和脚本语法。
 
 ## 常见问题
 
